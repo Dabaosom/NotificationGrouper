@@ -104,10 +104,10 @@ static NGView *ngBadgeView = nil;
 - (void)layoutSubviews {
     %orig;
     for (UIView *sub in self.subviews) {
-        if ([sub isKindOfClass:[UILabel class]]) {
-            NSString *txt = sub.text;
+        if ([sub isKindOfClass:objc_getClass("UILabel")]) {
+            NSString *txt = [sub valueForKey:@"text"];
             if (txt && [txt.lowercaseString containsString:@"older"]) {
-                sub.hidden = YES;
+                [sub setValue:@YES forKey:@"hidden"];
             }
         }
     }
@@ -147,7 +147,7 @@ static void ngReloadPrefs() {
 - (NSString *)notificationIdentifier;
 - (id)bulletin;
 - (id)destinationBundleIdentifier;
-- (id)timestamp;
+
 - (id)content;
 @end
 
@@ -173,7 +173,8 @@ static void ngReloadPrefs() {
 @end
 
 @interface NCNotificationSeparatorsListViewController : UIViewController
-@property (nonatomic, readonly) UIView *view;
+@property (nonatomic, strong, readonly) UIView *view;
+- (UIView *)view;
 @end
 
 @interface NCNotificationListSectionHeaderView : UIView
@@ -286,7 +287,8 @@ static void ngReloadPrefs() {
         if (!found) [self.notificationRequests[bundleID] addObject:nid];
     }
     
-    self.counts[bundleID] = @(self.notificationRequests[bundleID].count);
+    NSArray *arr = self.notificationRequests[bundleID];
+    self.counts[bundleID] = @(arr ? arr.count : 0);
 }
 
 - (void)removeRequest:(id)req {
