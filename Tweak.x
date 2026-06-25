@@ -13,8 +13,11 @@ static BOOL ngEnabled = YES;
 static NSInteger ngSortMode = 0;
 
 // ============================================
-// NGManager 前向声明 (供 hooks 使用)
+// NGManager 前向声明
 // ============================================
+@class NGView;
+static NGView *ngBadgeView = nil;
+
 @interface NGManager : NSObject
 + (instancetype)sharedInstance;
 - (NSString *)bundleIDForRequest:(id)req;
@@ -30,7 +33,7 @@ static NSInteger ngSortMode = 0;
 @end
 
 // ============================================
-// HOOKS (使用运行时查找，不依赖编译期符号)
+// HOOKS
 // ============================================
 %group NotificationGrouperiOS17
 
@@ -41,7 +44,7 @@ static NSInteger ngSortMode = 0;
     if (!inited && ngEnabled) {
         inited = YES;
         dispatch_async(dispatch_get_main_queue(), ^{
-            UIView *v = [self valueForKey:@"view"];
+            UIView *v = self.view;
             if (v && ![v.subviews containsObject:ngBadgeView]) {
                 NGView *bv = [[NGView alloc] initWithFrame:CGRectMake(0, 0, 44, v.bounds.size.height)];
                 [v addSubview:bv];
@@ -90,7 +93,7 @@ static NSInteger ngSortMode = 0;
 %hook NCNotificationListSectionHeaderView
 - (void)layoutSubviews {
     %orig;
-    [self setValue:@YES forKey:@"hidden"];
+    self.hidden = YES;
 }
 - (CGRect)frame {
     return CGRectZero;
@@ -100,12 +103,11 @@ static NSInteger ngSortMode = 0;
 %hook NCNotificationListSectionRevealHintView
 - (void)layoutSubviews {
     %orig;
-    NSArray *subs = [self valueForKey:@"subviews"];
-    for (id sub in subs) {
-        if ([sub isKindOfClass:objc_getClass("UILabel")]) {
-            NSString *txt = [sub valueForKey:@"text"];
+    for (UIView *sub in self.subviews) {
+        if ([sub isKindOfClass:[UILabel class]]) {
+            NSString *txt = sub.text;
             if (txt && [txt.lowercaseString containsString:@"older"]) {
-                [sub setValue:@YES forKey:@"hidden"];
+                sub.hidden = YES;
             }
         }
     }
@@ -119,10 +121,8 @@ static NSInteger ngSortMode = 0;
 // ============================================
 static void ngReloadPrefs() {
     NSDictionary *prefs = nil;
-    NSString *jbPath = @"/var/jb/Library/Preferences/com.yourname.notificationgrouper.plist";
-    NSString *mobPath = @"/var/mobile/Library/Preferences/com.yourname.notificationgrouper.plist";
-    prefs = [[NSDictionary alloc] initWithContentsOfFile:jbPath];
-    if (!prefs) prefs = [[NSDictionary alloc] initWithContentsOfFile:mobPath];
+    prefs = [[NSDictionary alloc] initWithContentsOfFile:@"/var/jb/Library/Preferences/com.yourname.notificationgrouper.plist"];
+    if (!prefs) prefs = [[NSDictionary alloc] initWithContentsOfFile:@"/var/mobile/Library/Preferences/com.yourname.notificationgrouper.plist"];
     ngEnabled = prefs[@"Enabled"] != nil ? [prefs[@"Enabled"] boolValue] : YES;
     ngSortMode = [prefs[@"SortMode"] integerValue] ?: 0;
 }
@@ -137,6 +137,58 @@ static void ngReloadPrefs() {
         CFNotificationSuspensionBehaviorCoalesce
     );
 }
+
+// ============================================
+// 私有类完整接口声明 (供 NGManager 实现使用)
+// ============================================
+
+@interface NCNotificationRequest : NSObject
+- (NSString *)sectionIdentifier;
+- (NSString *)notificationIdentifier;
+- (id)bulletin;
+- (id)destinationBundleIdentifier;
+- (id)timestamp;
+- (id)content;
+@end
+
+@interface NCCoalescedNotification : NSObject
+@property (nonatomic, readonly) NSArray *notificationRequests;
+@end
+
+@interface NCNotificationContent : NSObject
+@property (nonatomic, copy) NSString *header;
+@property (nonatomic, copy) NSString *subheader;
+@end
+
+@interface NCBulletinRequest : NSObject
+@property (nonatomic, copy) NSString *sectionID;
+@end
+
+@interface NCNotificationCombinedListViewController : UIViewController
+@property (nonatomic, readonly) UIView *view;
+@end
+
+@interface NCNotificationStructuredListViewController : UIViewController
+@property (nonatomic, readonly) UIView *view;
+@end
+
+@interface NCNotificationSeparatorsListViewController : UIViewController
+@property (nonatomic, readonly) UIView *view;
+@end
+
+@interface NCNotificationListSectionHeaderView : UIView
+@end
+
+@interface NCNotificationListSectionRevealHintView : UIView
+@end
+
+@interface SBIconModel : NSObject
+- (id)applicationIconForBundleIdentifier:(NSString *)bundleID;
+@end
+
+@interface SBIcon : NSObject
+- (id)getIconImage:(int)size;
+@end
 
 // ============================================
 // NGManager 实现
@@ -180,24 +232,14 @@ static void ngReloadPrefs() {
 
 - (NSString *)bundleIDForRequest:(id)req {
     if (!req) return nil;
-    // Try sectionIdentifier
-    if ([req respondsToSelector:@selector(sectionIdentifier)]) {
-        NSString *bid = [req sectionIdentifier];
+    NSString *bid = [req sectionIdentifier];
+    if (bid) return bid;
+    id bulletin = [req bulletin];
+    if (bulletin && [bulletin respondsToSelector:@selector(sectionID)]) {
+        bid = [bulletin sectionID];
         if (bid) return bid;
     }
-    // Try bulletin.sectionID
-    if ([req respondsToSelector:@selector(bulletin)]) {
-        id bulletin = [req bulletin];
-        if (bulletin && [bulletin respondsToSelector:@selector(sectionID)]) {
-            NSString *bid = [bulletin sectionID];
-            if (bid) return bid;
-        }
-    }
-    // Try destinationBundleIdentifier
-    if ([req respondsToSelector:@selector(destinationBundleIdentifier)]) {
-        return [req destinationBundleIdentifier];
-    }
-    return nil;
+    return [req destinationBundleIdentifier];
 }
 
 - (NSString *)nameForBundleID:(NSString *)bundleID {
@@ -213,7 +255,6 @@ static void ngReloadPrefs() {
     NSString *bundleID = [self bundleIDForRequest:req];
     if (!bundleID) return;
     
-    // Extract name from content
     if ([req respondsToSelector:@selector(content)]) {
         id content = [req content];
         if (content && [content respondsToSelector:@selector(header)]) {
@@ -222,9 +263,8 @@ static void ngReloadPrefs() {
         }
     }
     
-    // Timestamp
     if ([req respondsToSelector:@selector(timestamp)]) {
-        id ts = [req performSelector:@selector(timestamp)];
+        id ts = [req timestamp];
         if ([ts isKindOfClass:[NSDate class]]) {
             NSDate *existing = self.timestamps[bundleID];
             if (!existing || [(NSDate *)ts compare:existing] == NSOrderedDescending) {
@@ -233,12 +273,7 @@ static void ngReloadPrefs() {
         }
     }
     
-    // Store request ID
-    NSString *nid = nil;
-    if ([req respondsToSelector:@selector(notificationIdentifier)]) {
-        nid = [req notificationIdentifier];
-    }
-    
+    NSString *nid = [req notificationIdentifier];
     if (!self.notificationRequests[bundleID]) {
         self.notificationRequests[bundleID] = [NSMutableArray new];
     }
@@ -258,10 +293,7 @@ static void ngReloadPrefs() {
     if (!req) return;
     NSString *bundleID = [self bundleIDForRequest:req];
     if (!bundleID) return;
-    NSString *nid = nil;
-    if ([req respondsToSelector:@selector(notificationIdentifier)]) {
-        nid = [req notificationIdentifier];
-    }
+    NSString *nid = [req notificationIdentifier];
     if (nid && self.notificationRequests[bundleID]) {
         NSMutableArray *arr = self.notificationRequests[bundleID];
         for (NSInteger i = arr.count - 1; i >= 0; i--) {
@@ -277,27 +309,21 @@ static void ngReloadPrefs() {
     id ctrl = [$SBIconController performSelector:@selector(sharedInstance)];
     if (!ctrl) return nil;
     
-    Class $SBIconModel = objc_getClass("SBIconModel");
-    Class $SBIconViewMap = objc_getClass("SBIconViewMap");
-    Class $SBIcon = objc_getClass("SBIcon");
-    
-    id model = nil;
+    SBIconModel *model = nil;
     if ([ctrl respondsToSelector:@selector(homescreenIconViewMap)]) {
         id map = [ctrl performSelector:@selector(homescreenIconViewMap)];
-        if ($SBIconViewMap && map && [map respondsToSelector:@selector(iconModel)]) {
+        if (map && [map respondsToSelector:@selector(iconModel)]) {
             model = [map performSelector:@selector(iconModel)];
         }
     }
     if (!model && [ctrl respondsToSelector:@selector(model)]) {
         model = [ctrl performSelector:@selector(model)];
     }
-    if (!model || !$SBIconModel) return nil;
+    if (!model) return nil;
     
-    id icon = [model applicationIconForBundleIdentifier:bundleID];
-    if (icon && $SBIcon && [icon isKindOfClass:$SBIcon]) {
-        if ([icon respondsToSelector:@selector(getIconImage:)]) {
-            return [icon getIconImage:2];
-        }
+    SBIcon *icon = [model applicationIconForBundleIdentifier:bundleID];
+    if (icon && [icon respondsToSelector:@selector(getIconImage:)]) {
+        return [icon getIconImage:2];
     }
     return nil;
 }
@@ -375,9 +401,11 @@ static void ngReloadPrefs() {
 
 + (void)refreshBadge {
     dispatch_async(dispatch_get_main_queue(), ^{
-        for (UIView *v in [UIApplication sharedApplication].keyWindow.subviews) {
-            if ([v isKindOfClass:[NGView class]]) {
-                [(NGView *)v refreshInternal];
+        for (UIWindow *win in [UIApplication sharedApplication].windows) {
+            for (UIView *v in win.subviews) {
+                if ([v isKindOfClass:[NGView class]]) {
+                    [(NGView *)v refreshInternal];
+                }
             }
         }
     });
