@@ -1,4 +1,4 @@
-// NotificationGrouper - iOS 17 通知归纳插件 (基于 Axon 架构)
+// NotificationGrouper - iOS 17 通知归纳插件
 // 功能: 按应用分组通知、聚合显示、摘要管理
 // 适配: iOS 17.x (Dopamine/Palera1n rootless)
 
@@ -7,39 +7,22 @@
 #import <objc/runtime.h>
 
 // ============================================
-// 设置项 (放在所有代码之前，供 hooks 使用)
+// 全局设置
 // ============================================
 static BOOL ngEnabled = YES;
-static BOOL ngGroupByApp = YES;
-static NSInteger ngAggregationWindow = 300;
 static NSInteger ngSortMode = 0;
 
 // ============================================
-// 私有类前向声明 (供 %hook 引用)
-// ============================================
-@class NCNotificationRequest;
-@class NCCoalescedNotification;
-@class NCNotificationContent;
-@class NCBulletinRequest;
-@class NCNotificationDispatcher;
-@class NCNotificationStore;
-@class SBIconModel;
-@class SBIcon;
-@class SBIconViewMap;
-
-// ============================================
-// NGManager 单例前向声明 (供 hooks 使用)
+// NGManager 前向声明 (供 hooks 使用)
 // ============================================
 @interface NGManager : NSObject
 + (instancetype)sharedInstance;
 - (NSString *)bundleIDForRequest:(id)req;
-- (NSDate *)timestampForRequest:(id)req;
-- (NSString *)nidForRequest:(id)req;
 - (void)insertRequest:(id)req;
 - (void)removeRequest:(id)req;
 - (NSInteger)countForBundleID:(NSString *)bundleID;
-- (UIImage *)iconForBundleID:(NSString *)bundleID;
 - (NSString *)nameForBundleID:(NSString *)bundleID;
+- (UIImage *)iconForBundleID:(NSString *)bundleID;
 @end
 
 @interface NGView : UIView
@@ -47,23 +30,22 @@ static NSInteger ngSortMode = 0;
 @end
 
 // ============================================
-// HOOKS - 放在所有实现代码之前
+// HOOKS (使用运行时查找，不依赖编译期符号)
 // ============================================
 %group NotificationGrouperiOS17
-
-static NGManager *ngManager = nil;
-static NGView *ngBadgeView = nil;
-static BOOL ngBadgeInited = NO;
 
 %hook NCNotificationSeparatorsListViewController
 - (void)viewDidLoad {
     %orig;
-    if (!ngBadgeInited && ngEnabled) {
-        ngBadgeInited = YES;
+    static BOOL inited = NO;
+    if (!inited && ngEnabled) {
+        inited = YES;
         dispatch_async(dispatch_get_main_queue(), ^{
-            if (!ngBadgeView && self.view) {
-                ngBadgeView = [[NGView alloc] initWithFrame:CGRectMake(0, 0, 44, self.view.bounds.size.height)];
-                [self.view addSubview:ngBadgeView];
+            UIView *v = [self valueForKey:@"view"];
+            if (v && ![v.subviews containsObject:ngBadgeView]) {
+                NGView *bv = [[NGView alloc] initWithFrame:CGRectMake(0, 0, 44, v.bounds.size.height)];
+                [v addSubview:bv];
+                ngBadgeView = bv;
                 NSLog(@"[NotificationGrouper] Badge view added");
             }
         });
@@ -86,14 +68,6 @@ static BOOL ngBadgeInited = NO;
     }
     return %orig;
 }
-- (bool)modifyNotificationRequest:(id)req forCoalescedNotification:(id)n {
-    if (ngEnabled) {
-        [[NGManager sharedInstance] removeRequest:req];
-        [[NGManager sharedInstance] insertRequest:req];
-        dispatch_async(dispatch_get_main_queue(), ^{ [NGView refreshBadge]; });
-    }
-    return %orig;
-}
 %end
 
 %hook NCNotificationStructuredListViewController
@@ -111,20 +85,12 @@ static BOOL ngBadgeInited = NO;
     }
     return %orig;
 }
-- (bool)modifyNotificationRequest:(id)req {
-    if (ngEnabled) {
-        [[NGManager sharedInstance] removeRequest:req];
-        [[NGManager sharedInstance] insertRequest:req];
-        dispatch_async(dispatch_get_main_queue(), ^{ [NGView refreshBadge]; });
-    }
-    return %orig;
-}
 %end
 
 %hook NCNotificationListSectionHeaderView
 - (void)layoutSubviews {
     %orig;
-    self.hidden = YES;
+    [self setValue:@YES forKey:@"hidden"];
 }
 - (CGRect)frame {
     return CGRectZero;
@@ -134,11 +100,13 @@ static BOOL ngBadgeInited = NO;
 %hook NCNotificationListSectionRevealHintView
 - (void)layoutSubviews {
     %orig;
-    for (UIView *sub in self.subviews) {
-        if ([sub isKindOfClass:[UILabel class]]) {
-            UILabel *lbl = (UILabel *)sub;
-            NSString *txt = lbl.text;
-            if (txt && [txt.lowercaseString containsString:@"older"]) lbl.hidden = YES;
+    NSArray *subs = [self valueForKey:@"subviews"];
+    for (id sub in subs) {
+        if ([sub isKindOfClass:objc_getClass("UILabel")]) {
+            NSString *txt = [sub valueForKey:@"text"];
+            if (txt && [txt.lowercaseString containsString:@"older"]) {
+                [sub setValue:@YES forKey:@"hidden"];
+            }
         }
     }
 }
@@ -149,96 +117,26 @@ static BOOL ngBadgeInited = NO;
 // ============================================
 // 构造函数
 // ============================================
-%ctor {
-    ngManager = [NGManager sharedInstance];
-    NSLog(@"[NotificationGrouper] Loading...");
-    
-    // 加载设置
-    NSDictionary *prefs = [[NSDictionary alloc] initWithContentsOfFile:@"/var/jb/Library/Preferences/com.yourname.notificationgrouper.plist"];
-    if (!prefs) {
-        prefs = [[NSDictionary alloc] initWithContentsOfFile:@"/var/mobile/Library/Preferences/com.yourname.notificationgrouper.plist"];
-    }
+static void ngReloadPrefs() {
+    NSDictionary *prefs = nil;
+    NSString *jbPath = @"/var/jb/Library/Preferences/com.yourname.notificationgrouper.plist";
+    NSString *mobPath = @"/var/mobile/Library/Preferences/com.yourname.notificationgrouper.plist";
+    prefs = [[NSDictionary alloc] initWithContentsOfFile:jbPath];
+    if (!prefs) prefs = [[NSDictionary alloc] initWithContentsOfFile:mobPath];
     ngEnabled = prefs[@"Enabled"] != nil ? [prefs[@"Enabled"] boolValue] : YES;
-    ngGroupByApp = prefs[@"GroupByApp"] != nil ? [prefs[@"GroupByApp"] boolValue] : YES;
-    ngAggregationWindow = [prefs[@"AggregationWindow"] integerValue] ?: 300;
     ngSortMode = [prefs[@"SortMode"] integerValue] ?: 0;
-    
-    if (ngEnabled) {
-        %init(NotificationGrouperiOS17);
-        NSLog(@"[NotificationGrouper] Hooks initialized");
-    }
-    
+}
+
+%ctor {
+    ngReloadPrefs();
+    if (ngEnabled) %init(NotificationGrouperiOS17);
     CFNotificationCenterAddObserver(
         CFNotificationCenterGetDarwinNotifyCenter(), NULL,
-        (CFNotificationCallback)(^{
-            NSDictionary *p = [[NSDictionary alloc] initWithContentsOfFile:@"/var/jb/Library/Preferences/com.yourname.notificationgrouper.plist"];
-            if (!p) p = [[NSDictionary alloc] initWithContentsOfFile:@"/var/mobile/Library/Preferences/com.yourname.notificationgrouper.plist"];
-            ngEnabled = p[@"Enabled"] != nil ? [p[@"Enabled"] boolValue] : YES;
-            ngGroupByApp = p[@"GroupByApp"] != nil ? [p[@"GroupByApp"] boolValue] : YES;
-            ngAggregationWindow = [p[@"AggregationWindow"] integerValue] ?: 300;
-            ngSortMode = [p[@"SortMode"] integerValue] ?: 0;
-        }),
+        (CFNotificationCallback)ngReloadPrefs,
         CFSTR("com.yourname.notificationgrouper/ReloadPrefs"), NULL,
         CFNotificationSuspensionBehaviorCoalesce
     );
 }
-
-// ============================================
-// 私有类接口定义 (供实现代码使用)
-// ============================================
-
-@interface NCNotificationRequest : NSObject
-- (NSString *)sectionIdentifier;
-- (NSString *)notificationIdentifier;
-- (id)bulletin;
-- (id)destinationBundleIdentifier;
-- (NSDate *)timestamp;
-- (id)content;
-@end
-
-@interface NCCoalescedNotification : NSObject
-@property (nonatomic, readonly) NSArray *notificationRequests;
-@end
-
-@interface NCNotificationContent : NSObject
-@property (nonatomic, copy) NSString *header;
-@property (nonatomic, copy) NSString *subheader;
-@end
-
-@interface NCBulletinRequest : NSObject
-@property (nonatomic, copy) NSString *sectionID;
-@end
-
-@interface NCNotificationDispatcher : NSObject
-- (id)notificationStore;
-@end
-
-@interface NCNotificationStore : NSObject
-- (NCCoalescedNotification *)coalescedNotificationForRequest:(NCNotificationRequest *)req;
-@end
-
-@interface NCNotificationCombinedListViewController : UIViewController
-@end
-
-@interface NCNotificationStructuredListViewController : UIViewController
-@end
-
-@interface NCNotificationSeparatorsListViewController : UIViewController
-@end
-
-@interface NCNotificationListSectionHeaderView : UIView
-@end
-
-@interface NCNotificationListSectionRevealHintView : UIView
-@end
-
-@interface SBIconModel : NSObject
-- (id)applicationIconForBundleIdentifier:(NSString *)bundleID;
-@end
-
-@interface SBIcon : NSObject
-- (id)getIconImage:(int)size;
-@end
 
 // ============================================
 // NGManager 实现
@@ -250,11 +148,6 @@ static BOOL ngBadgeInited = NO;
     static dispatch_once_t onceToken;
     dispatch_once(&onceToken, ^{ shared = [[NGManager alloc] init]; });
     return shared;
-}
-
-- (instancetype)init {
-    self = [super init];
-    return self;
 }
 
 - (NSMutableDictionary *)notificationRequests {
@@ -287,26 +180,32 @@ static BOOL ngBadgeInited = NO;
 
 - (NSString *)bundleIDForRequest:(id)req {
     if (!req) return nil;
-    NSString *bid = [req sectionIdentifier];
-    if (bid) return bid;
-    id bulletin = [req bulletin];
-    if (bulletin && [bulletin respondsToSelector:@selector(sectionID)]) {
-        bid = [bulletin sectionID];
+    // Try sectionIdentifier
+    if ([req respondsToSelector:@selector(sectionIdentifier)]) {
+        NSString *bid = [req sectionIdentifier];
         if (bid) return bid;
     }
-    return [req destinationBundleIdentifier];
-}
-
-- (NSDate *)timestampForRequest:(id)req {
-    if (!req) return nil;
-    if ([req respondsToSelector:@selector(timestamp)]) return [req timestamp];
+    // Try bulletin.sectionID
+    if ([req respondsToSelector:@selector(bulletin)]) {
+        id bulletin = [req bulletin];
+        if (bulletin && [bulletin respondsToSelector:@selector(sectionID)]) {
+            NSString *bid = [bulletin sectionID];
+            if (bid) return bid;
+        }
+    }
+    // Try destinationBundleIdentifier
+    if ([req respondsToSelector:@selector(destinationBundleIdentifier)]) {
+        return [req destinationBundleIdentifier];
+    }
     return nil;
 }
 
-- (NSString *)nidForRequest:(id)req {
-    if (!req) return nil;
-    if ([req respondsToSelector:@selector(notificationIdentifier)]) return [req notificationIdentifier];
-    return nil;
+- (NSString *)nameForBundleID:(NSString *)bundleID {
+    return self.names[bundleID] ?: bundleID;
+}
+
+- (NSInteger)countForBundleID:(NSString *)bundleID {
+    return self.counts[bundleID] ? [self.counts[bundleID] integerValue] : 0;
 }
 
 - (void)insertRequest:(id)req {
@@ -314,29 +213,36 @@ static BOOL ngBadgeInited = NO;
     NSString *bundleID = [self bundleIDForRequest:req];
     if (!bundleID) return;
     
-    // 提取名称
+    // Extract name from content
     if ([req respondsToSelector:@selector(content)]) {
         id content = [req content];
         if (content && [content respondsToSelector:@selector(header)]) {
-            NSString *h = [content header];
+            id h = [content header];
             if (h && [h isKindOfClass:[NSString class]]) self.names[bundleID] = h;
         }
     }
     
-    // 时间戳
-    NSDate *ts = [self timestampForRequest:req];
-    if (ts) {
-        NSDate *existing = self.timestamps[bundleID];
-        if (!existing || [ts compare:existing] == NSOrderedDescending) {
-            self.timestamps[bundleID] = ts;
+    // Timestamp
+    if ([req respondsToSelector:@selector(timestamp)]) {
+        id ts = [req performSelector:@selector(timestamp)];
+        if ([ts isKindOfClass:[NSDate class]]) {
+            NSDate *existing = self.timestamps[bundleID];
+            if (!existing || [(NSDate *)ts compare:existing] == NSOrderedDescending) {
+                self.timestamps[bundleID] = ts;
+            }
         }
     }
     
-    // 添加到列表
+    // Store request ID
+    NSString *nid = nil;
+    if ([req respondsToSelector:@selector(notificationIdentifier)]) {
+        nid = [req notificationIdentifier];
+    }
+    
     if (!self.notificationRequests[bundleID]) {
         self.notificationRequests[bundleID] = [NSMutableArray new];
     }
-    NSString *nid = [self nidForRequest:req];
+    
     if (nid) {
         BOOL found = NO;
         for (NSString *eid in self.notificationRequests[bundleID]) {
@@ -352,7 +258,10 @@ static BOOL ngBadgeInited = NO;
     if (!req) return;
     NSString *bundleID = [self bundleIDForRequest:req];
     if (!bundleID) return;
-    NSString *nid = [self nidForRequest:req];
+    NSString *nid = nil;
+    if ([req respondsToSelector:@selector(notificationIdentifier)]) {
+        nid = [req notificationIdentifier];
+    }
     if (nid && self.notificationRequests[bundleID]) {
         NSMutableArray *arr = self.notificationRequests[bundleID];
         for (NSInteger i = arr.count - 1; i >= 0; i--) {
@@ -362,36 +271,33 @@ static BOOL ngBadgeInited = NO;
     }
 }
 
-- (NSInteger)countForBundleID:(NSString *)bundleID {
-    return self.counts[bundleID] ? [self.counts[bundleID] integerValue] : 0;
-}
-
-- (NSString *)nameForBundleID:(NSString *)bundleID {
-    return self.names[bundleID] ?: bundleID;
-}
-
 - (UIImage *)iconForBundleID:(NSString *)bundleID {
     Class $SBIconController = objc_getClass("SBIconController");
     if (!$SBIconController) return nil;
-    
     id ctrl = [$SBIconController performSelector:@selector(sharedInstance)];
     if (!ctrl) return nil;
     
-    SBIconModel *model = nil;
+    Class $SBIconModel = objc_getClass("SBIconModel");
+    Class $SBIconViewMap = objc_getClass("SBIconViewMap");
+    Class $SBIcon = objc_getClass("SBIcon");
+    
+    id model = nil;
     if ([ctrl respondsToSelector:@selector(homescreenIconViewMap)]) {
         id map = [ctrl performSelector:@selector(homescreenIconViewMap)];
-        if (map && [map respondsToSelector:@selector(iconModel)]) {
+        if ($SBIconViewMap && map && [map respondsToSelector:@selector(iconModel)]) {
             model = [map performSelector:@selector(iconModel)];
         }
     }
     if (!model && [ctrl respondsToSelector:@selector(model)]) {
         model = [ctrl performSelector:@selector(model)];
     }
-    if (!model) return nil;
+    if (!model || !$SBIconModel) return nil;
     
-    SBIcon *icon = [model applicationIconForBundleIdentifier:bundleID];
-    if (icon && [icon respondsToSelector:@selector(getIconImage:)]) {
-        return [icon getIconImage:2];
+    id icon = [model applicationIconForBundleIdentifier:bundleID];
+    if (icon && $SBIcon && [icon isKindOfClass:$SBIcon]) {
+        if ([icon respondsToSelector:@selector(getIconImage:)]) {
+            return [icon getIconImage:2];
+        }
     }
     return nil;
 }
@@ -405,6 +311,7 @@ static BOOL ngBadgeInited = NO;
 @property (nonatomic, strong) UIImageView *iconView;
 @property (nonatomic, strong) UILabel *countBadge;
 @property (nonatomic, strong) UILabel *nameLabel;
+- (void)configWithBundleID:(NSString *)bundleID count:(NSInteger)count;
 @end
 
 @implementation NGViewCell
@@ -467,8 +374,13 @@ static BOOL ngBadgeInited = NO;
 @implementation NGView
 
 + (void)refreshBadge {
-    if (!ngBadgeView) return;
-    [ngBadgeView refreshInternal];
+    dispatch_async(dispatch_get_main_queue(), ^{
+        for (UIView *v in [UIApplication sharedApplication].keyWindow.subviews) {
+            if ([v isKindOfClass:[NGView class]]) {
+                [(NGView *)v refreshInternal];
+            }
+        }
+    });
 }
 
 - (instancetype)initWithFrame:(CGRect)frame {
