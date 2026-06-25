@@ -200,20 +200,36 @@ static void loadPrefs() {
 }
 
 - (UIImage *)iconForBundleIdentifier:(NSString *)bundleID {
-    SBIconController *ctrl = [SBIconController sharedInstance];
+    Class $SBIconController = objc_getClass("SBIconController");
+    if (!$SBIconController) return nil;
+    
+    id ctrl = [$SBIconController performSelector:@selector(sharedInstance)];
     if (!ctrl) return nil;
     
-    SBIconViewMap *map = [ctrl homescreenIconViewMap];
-    SBIconModel *model = map ? [map iconModel] : [ctrl model];
+    Class $SBIconViewMap = objc_getClass("SBIconViewMap");
+    SBIconModel *model = nil;
+    if ($SBIconViewMap && [ctrl respondsToSelector:@selector(homescreenIconViewMap)]) {
+        id map = [ctrl homescreenIconViewMap];
+        if (map && [map respondsToSelector:@selector(iconModel)]) {
+            model = [map iconModel];
+        }
+    }
+    if (!model && [ctrl respondsToSelector:@selector(model)]) {
+        model = [ctrl model];
     if (!model) return nil;
     
-    SBIcon *icon = [model applicationIconForBundleIdentifier:bundleID];
-    if (!icon) return nil;
+    Class $SBIconModel = objc_getClass("SBIconModel");
+    SBIcon *icon = nil;
+    if ($SBIconModel && model && [model respondsToSelector:@selector(applicationIconForBundleIdentifier:)]) {
+        icon = [model applicationIconForBundleIdentifier:bundleID];
+    }
     
-    if ([icon respondsToSelector:@selector(getIconImage:)]) {
-        return [icon getIconImage:2];
-    } else if ([icon respondsToSelector:@selector(iconImageWithInfo:)]) {
-        return [icon iconImageWithInfo:@{@"size": @60.0, @"scale": @2.0}];
+    if (icon) {
+        if ([icon respondsToSelector:@selector(getIconImage:)]) {
+            return [icon getIconImage:2];
+        } else if ([icon respondsToSelector:@selector(iconImageWithInfo:)]) {
+            return [icon iconImageWithInfo:@{@"size": @60.0, @"scale": @2.0}];
+        }
     }
     return nil;
 }

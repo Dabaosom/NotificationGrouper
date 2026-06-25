@@ -11,7 +11,7 @@ include $(THEOS)/makefiles/common.mk
 TWEAK_NAME = NotificationGrouper
 NotificationGrouper_FILES = Tweak.x
 NotificationGrouper_CFLAGS = -fobjc-arc -Wno-error
-NotificationGrouper_LDFLAGS = -framework Foundation -framework UIKit
+NotificationGrouper_LDFLAGS = -framework Foundation -framework UIKit -lsubstrate
 
 # Rootless package
 THEOS_PACKAGE_SCHEME = rootless
