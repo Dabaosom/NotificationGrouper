@@ -1,0 +1,15 @@
+
+Package: com.yourname.notificationgrouper
+Name: NotificationGrouper
+Version: 1.0.0
+Architecture: iphoneos-arm64
+Description: iOS 17 通知归纳插件 - 按应用分组、时间窗口聚合、摘要显示
+Maintainer: Your Name <your@email.com>
+Author: Your Name
+Depends: mobilesubstrate (>= 0.9.1001), firmware (>= 17.0)
+Conflicts: com.apple.springboard (<< 17.0)
+Replaces: 
+Provides: 
+Section: Tweaks
+Priority: optional
+Tags: purpose::extension, ios::ios17, role::developer

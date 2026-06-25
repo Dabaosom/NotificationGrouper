@@ -1,0 +1,57 @@
+
+name: Build NotificationGrouper
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-15
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Install Theos
+      run: |
+        export THEOS=/Users/runner/work/Theos
+        git clone --recursive https://github.com/theos/theos.git $THEOS
+        echo "THEOS=$THEOS" >> $GITHUB_ENV
+        echo "PATH=$THEOS/bin:$PATH" >> $GITHUB_ENV
+      shell: bash
+      
+    - name: Download iOS 17 SDK
+      run: |
+        # 尝试从 MagicFoundation/PlatformSDKs 下载
+        curl -L -o ios17.sdk.tar.xz "https://github.com/MagicFoundation/PlatformSDKs/releases/download/ios-17.0/sdk.tar.xz" || {
+          echo "::warning::Failed to download iOS 17 SDK, trying alternative..."
+          # 备选方案：使用 iOS 16.5 SDK
+          curl -L -o ios16.sdk.tar.xz "https://github.com/MagicFoundation/PlatformSDKs/releases/download/ios-16.5/sdk.tar.xz"
+        }
+        
+        # 解压 SDK
+        mkdir -p $THEOS/sdks
+        tar -xf ios*.sdk.tar.xz -C $THEOS/sdks/
+        
+        # 验证 SDK
+        ls -la $THEOS/sdks/
+      shell: bash
+      continue-on-error: true
+      
+    - name: Build Tweak
+      run: |
+        cd $GITHUB_WORKSPACE
+        make clean
+        make package FINALPACKAGE=1
+      shell: bash
+      
+    - name: Upload DEB Package
+      uses: actions/upload-artifact@v4
+      with:
+        name: NotificationGrouper-DEB
+        path: debs/*.deb
+        retention-days: 30
+      if: always()
