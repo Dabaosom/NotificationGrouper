@@ -5,6 +5,7 @@
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
+#include <notify.h>
 
 // 通知组管理单例
 @interface NGNotificationManager : NSObject
@@ -173,32 +174,6 @@
     }
     
     return %orig(bulletin, sectionID);
-}
-
-%end
-
-// Hook 通知视图控制器，修改显示
-%hook NCNotificationViewController
-
-- (void)loadView {
-    %orig;
-    
-    // 可以在这里修改通知的UI显示
-    NGNotificationManager *manager = [NGNotificationManager sharedManager];
-    NSString *bundleID = [self valueForKey:@"_notificationRequest"] ? 
-                         [[self valueForKey:@"_notificationRequest"] valueForKey:@"_sectionID"] : nil;
-    
-    if (bundleID && [manager shouldAggregateNotificationFromApp:bundleID]) {
-        // 修改通知标题为聚合摘要
-        NSString *summary = [manager getSummaryForBundleID:bundleID];
-        if (summary) {
-            // 尝试找到标题Label并修改
-            UILabel *titleLabel = [self valueForKey:@"_titleLabel"];
-            if (titleLabel) {
-                titleLabel.text = summary;
-            }
-        }
-    }
 }
 
 %end
