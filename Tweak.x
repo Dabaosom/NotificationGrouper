@@ -1,327 +1,558 @@
-
-// NotificationGrouper - iOS 17 通知归纳插件
-// 功能: 按应用分组、时间窗口聚合、摘要显示
+// NotificationGrouper - iOS 17 通知归纳插件 (基于 Axon 架构)
+// 功能: 按应用分组通知、聚合显示、摘要管理
+// 适配: iOS 17.x (Dopamine/Palera1n rootless)
 
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
-#include <notify.h>
 
-// 通知组管理单例
-@interface NGNotificationManager : NSObject
-@property (nonatomic, strong) NSMutableDictionary *groupedNotifications;  // bundleID -> notifications array
-@property (nonatomic, strong) NSMutableDictionary *lastNotificationTime;   // bundleID -> last timestamp
-@property (nonatomic, assign) NSTimeInterval aggregationWindow;           // 聚合时间窗口（秒）
-@property (nonatomic, assign) BOOL enabled;
-@property (nonatomic, strong) NSSet *whitelistApps;                     // 白名单（不聚合的App）
+// ============================================
+// 设置项定义
+// ============================================
+static BOOL ngEnabled = YES;
+static BOOL ngGroupByApp = YES;
+static NSInteger ngAggregationWindow = 300; // 秒
+static NSInteger ngMaxCount = 99;
+static NSInteger ngSortMode = 0; // 0=最新优先, 1=数量优先
 
-+ (instancetype)sharedManager;
-- (void)loadSettings;
-- (BOOL)shouldAggregateNotificationFromApp:(NSString *)bundleID;
-- (void)addNotification:(id)notification withBundleID:(NSString *)bundleID;
-- (NSString *)getSummaryForBundleID:(NSString *)bundleID;
-@end
-
-@implementation NGNotificationManager
-
-+ (instancetype)sharedManager {
-    static NGNotificationManager *manager = nil;
-    static dispatch_once_t onceToken;
-    dispatch_once(&onceToken, ^{
-        manager = [[NGNotificationManager alloc] init];
-    });
-    return manager;
+static void loadPrefs() {
+    NSDictionary *prefs = [[NSDictionary alloc] initWithContentsOfFile:@"/var/jb/Library/Preferences/com.yourname.notificationgrouper.plist"];
+    if (!prefs) {
+        prefs = [[NSDictionary alloc] initWithContentsOfFile:@"/var/mobile/Library/Preferences/com.yourname.notificationgrouper.plist"];
+    }
+    ngEnabled = prefs[@"Enabled"] != nil ? [prefs[@"Enabled"] boolValue] : YES;
+    ngGroupByApp = prefs[@"GroupByApp"] != nil ? [prefs[@"GroupByApp"] boolValue] : YES;
+    ngAggregationWindow = [prefs[@"AggregationWindow"] integerValue] ?: 300;
+    ngMaxCount = [prefs[@"MaxCount"] integerValue] ?: 99;
+    ngSortMode = [prefs[@"SortMode"] integerValue] ?: 0;
 }
 
-- (instancetype)init {
-    self = [super init];
+// ============================================
+// NCNotificationRequest 前向声明
+// ============================================
+@class NCNotificationRequest;
+@class NCCoalescedNotification;
+
+@interface NSObject (NCTimestamp)
+- (NSDate *)timestamp;
+@end
+
+// ============================================
+// NGNotificationManager - 通知管理器
+// ============================================
+@interface NGManager : NSObject
+@property (nonatomic, strong) NSMutableDictionary *notificationRequests; // bundleID -> NSMutableArray of requests
+@property (nonatomic, strong) NSMutableDictionary *timestamps;           // bundleID -> NSDate
+@property (nonatomic, strong) NSMutableDictionary *counts;                // bundleID -> count
+@property (nonatomic, strong) NSMutableDictionary *latestRequest;         // bundleID -> NCNotificationRequest
+@property (nonatomic, strong) NSMutableDictionary *names;                // bundleID -> header string
+@property (nonatomic, strong) id dispatcher;
+
++ (instancetype)sharedInstance;
+- (void)insertNotificationRequest:(NCNotificationRequest *)req;
+- (void)removeNotificationRequest:(NCNotificationRequest *)req;
+- (NSArray *)requestsForBundleIdentifier:(NSString *)bundleID;
+- (NSInteger)countForBundleIdentifier:(NSString *)bundleID;
+- (NSString *)summaryForBundleIdentifier:(NSString *)bundleID;
+- (UIImage *)iconForBundleIdentifier:(NSString *)bundleID;
+- (void)clearAll;
+@end
+
+@implementation NGManager
+
++ (instancetype)sharedInstance {
+    static NGManager *shared = nil;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        shared = [[NGManager alloc] init];
+        shared.notificationRequests = [NSMutableDictionary new];
+        shared.timestamps = [NSMutableDictionary new];
+        shared.counts = [NSMutableDictionary new];
+        shared.latestRequest = [NSMutableDictionary new];
+        shared.names = [NSMutableDictionary new];
+    });
+    return shared;
+}
+
+- (void)clearRubble {
+    for (NSString *bundleID in [self.notificationRequests allKeys]) {
+        NSMutableArray *requests = self.notificationRequests[bundleID];
+        for (NSInteger i = requests.count - 1; i >= 0; i--) {
+            if (!requests[i]) [requests removeObjectAtIndex:i];
+        }
+    }
+}
+
+- (void)updateCountForBundleIdentifier:(NSString *)bundleID {
+    NSArray *requests = [self requestsForBundleIdentifier:bundleID];
+    self.counts[bundleID] = @(requests.count);
+}
+
+- (NSInteger)countForBundleIdentifier:(NSString *)bundleID {
+    if (self.counts[bundleID]) return [self.counts[bundleID] integerValue];
+    [self updateCountForBundleIdentifier:bundleID];
+    return self.counts[bundleID] ? [self.counts[bundleID] integerValue] : 0;
+}
+
+- (NSString *)summaryForBundleIdentifier:(NSString *)bundleID {
+    NSInteger count = [self countForBundleIdentifier:bundleID];
+    if (count == 0) return nil;
+    
+    NSString *name = self.names[bundleID];
+    if (!name) name = bundleID;
+    
+    if (count == 1) {
+        // 单条通知，获取实际内容
+        NSArray *reqs = [self requestsForBundleIdentifier:bundleID];
+        if (reqs.count > 0) {
+            id req = reqs.firstObject;
+            if ([req respondsToSelector:@selector(content)]) {
+                id content = [req content];
+                if ([content respondsToSelector:@selector(title)]) {
+                    NSString *title = [content title];
+                    if (title) return title;
+                }
+            }
+        }
+        return name;
+    }
+    
+    return [NSString stringWithFormat:@"%@ (%ld条)", name, (long)count];
+}
+
+- (UIImage *)iconForBundleIdentifier:(NSString *)bundleID {
+    return [UIImage _applicationIconImageForBundleIdentifier:bundleID format:0 scale:[UIScreen mainScreen].scale];
+}
+
+- (void)insertNotificationRequest:(NCNotificationRequest *)req {
+    if (!req || ![req respondsToSelector:@selector(notificationIdentifier)]) return;
+    
+    NSString *bundleID = nil;
+    
+    // iOS 17: 多种方式获取 bundleID
+    if ([req respondsToSelector:@selector(sectionIdentifier)]) {
+        bundleID = [req sectionIdentifier];
+    }
+    if (!bundleID && [req respondsToSelector:@selector(bulletin)]) {
+        id bulletin = [req bulletin];
+        if ([bulletin respondsToSelector:@selector(sectionID)]) {
+            bundleID = [bulletin sectionID];
+        }
+    }
+    if (!bundleID && [req respondsToSelector:@selector(destinationBundleIdentifier)]) {
+        bundleID = [req destinationBundleIdentifier];
+    }
+    if (!bundleID) return;
+    
+    // 存储应用名称
+    if ([req respondsToSelector:@selector(content)]) {
+        id content = [req content];
+        if ([content respondsToSelector:@selector(header)]) {
+            NSString *header = [content header];
+            if (header) self.names[bundleID] = header;
+        }
+    }
+    
+    // 存储时间戳
+    if ([req respondsToSelector:@selector(timestamp)]) {
+        NSDate *ts = [req timestamp];
+        if (ts) {
+            if (!self.timestamps[bundleID] || [ts compare:self.timestamps[bundleID]] == NSOrderedDescending) {
+                self.timestamps[bundleID] = ts;
+            }
+        }
+    }
+    
+    // 记录最新请求
+    if (!self.latestRequest[bundleID] || 
+        ([req respondsToSelector:@selector(timestamp)] && 
+         [self.latestRequest[bundleID] respondsToSelector:@selector(timestamp)] &&
+         [ts compare:[self.latestRequest[bundleID] timestamp]] == NSOrderedDescending)) {
+        self.latestRequest[bundleID] = req;
+    }
+    
+    [self clearRubble];
+    
+    if (self.notificationRequests[bundleID]) {
+        BOOL found = NO;
+        for (NSInteger i = 0; i < [self.notificationRequests[bundleID] count]; i++) {
+            id existing = self.notificationRequests[bundleID][i];
+            if (existing && [existing respondsToSelector:@selector(notificationIdentifier)] &&
+                [[req notificationIdentifier] isEqualToString:[existing notificationIdentifier]]) {
+                found = YES;
+                break;
+            }
+        }
+        if (!found) [self.notificationRequests[bundleID] addObject:req];
+    } else {
+        self.notificationRequests[bundleID] = [NSMutableArray arrayWithObject:req];
+    }
+    
+    [self updateCountForBundleIdentifier:bundleID];
+}
+
+- (void)removeNotificationRequest:(NCNotificationRequest *)req {
+    if (!req || ![req respondsToSelector:@selector(notificationIdentifier)]) return;
+    
+    NSString *bundleID = nil;
+    if ([req respondsToSelector:@selector(sectionIdentifier)]) {
+        bundleID = [req sectionIdentifier];
+    }
+    if (!bundleID && [req respondsToSelector:@selector(bulletin)]) {
+        id bulletin = [req bulletin];
+        if ([bulletin respondsToSelector:@selector(sectionID)]) {
+            bundleID = [bulletin sectionID];
+        }
+    }
+    if (!bundleID && [req respondsToSelector:@selector(destinationBundleIdentifier)]) {
+        bundleID = [req destinationBundleIdentifier];
+    }
+    if (!bundleID) return;
+    
+    if (self.latestRequest[bundleID] && 
+        [[req notificationIdentifier] isEqualToString:[self.latestRequest[bundleID] notificationIdentifier]]) {
+        self.latestRequest[bundleID] = nil;
+    }
+    
+    [self clearRubble];
+    
+    if (self.notificationRequests[bundleID]) {
+        NSMutableArray *requests = self.notificationRequests[bundleID];
+        for (NSInteger i = requests.count - 1; i >= 0; i--) {
+            id existing = requests[i];
+            if (existing && [existing respondsToSelector:@selector(notificationIdentifier)] &&
+                [[req notificationIdentifier] isEqualToString:[existing notificationIdentifier]]) {
+                [requests removeObjectAtIndex:i];
+            }
+        }
+    }
+    
+    [self updateCountForBundleIdentifier:bundleID];
+}
+
+- (NSArray *)requestsForBundleIdentifier:(NSString *)bundleID {
+    [self clearRubble];
+    return self.notificationRequests[bundleID] ?: @[];
+}
+
+- (void)clearAll {
+    [self.notificationRequests removeAllObjects];
+    [self.timestamps removeAllObjects];
+    [self.counts removeAllObjects];
+    [self.latestRequest removeAllObjects];
+    [self.names removeAllObjects];
+}
+
+@end
+
+// ============================================
+// NGView - 自定义通知分组视图
+// ============================================
+@interface NGViewCell : UICollectionViewCell
+@property (nonatomic, strong) UIImageView *iconView;
+@property (nonatomic, strong) UILabel *nameLabel;
+@property (nonatomic, strong) UILabel *countLabel;
+@property (nonatomic, strong) UIImageView *chevron;
+@end
+
+@implementation NGViewCell
+
+- (instancetype)initWithFrame:(CGRect)frame {
+    self = [super initWithFrame:frame];
     if (self) {
-        _groupedNotifications = [NSMutableDictionary dictionary];
-        _lastNotificationTime = [NSMutableDictionary dictionary];
-        _aggregationWindow = 300;  // 默认5分钟
-        _enabled = YES;
-        _whitelistApps = [NSSet setWithObjects:@"com.apple.MobileSMS", nil];  // 短信默认不聚合
-        [self loadSettings];
+        _iconView = [[UIImageView alloc] initWithFrame:CGRectMake(8, 8, 36, 36)];
+        _iconView.contentMode = UIViewContentModeScaleAspectFit;
+        _iconView.layer.cornerRadius = 8;
+        _iconView.clipsToBounds = YES;
+        [self.contentView addSubview:_iconView];
+        
+        _countLabel = [[UILabel alloc] initWithFrame:CGRectMake(8, 46, 36, 14)];
+        _countLabel.font = [UIFont systemFontOfSize:10 weight:UIFontWeightMedium];
+        _countLabel.textAlignment = NSTextAlignmentCenter;
+        _countLabel.textColor = [UIColor whiteColor];
+        _countLabel.backgroundColor = [UIColor systemRedColor];
+        _countLabel.layer.cornerRadius = 7;
+        _countLabel.clipsToBounds = YES;
+        [self.contentView addSubview:_countLabel];
+        
+        _nameLabel = [[UILabel alloc] initWithFrame:CGRectMake(0, 64, 52, 20)];
+        _nameLabel.font = [UIFont systemFontOfSize:9 weight:UIFontWeightMedium];
+        _nameLabel.textAlignment = NSTextAlignmentCenter;
+        _nameLabel.numberOfLines = 2;
+        _nameLabel.lineBreakMode = NSLineBreakByTruncatingTail;
+        [self.contentView addSubview:_nameLabel];
     }
     return self;
 }
 
-- (void)loadSettings {
-    NSDictionary *settings = [NSDictionary dictionaryWithContentsOfFile:@"/var/mobile/Library/Preferences/com.yourname.notificationgrouper.plist"];
-    if (settings) {
-        _enabled = [settings[@"enabled"] boolValue] ?: YES;
-        _aggregationWindow = [settings[@"aggregationWindow"] doubleValue] ?: 300;
-        
-        NSArray *whitelist = settings[@"whitelistApps"];
-        if (whitelist) {
-            _whitelistApps = [NSSet setWithArray:whitelist];
-        }
-    }
-}
-
-- (BOOL)shouldAggregateNotificationFromApp:(NSString *)bundleID {
-    if (!_enabled) return NO;
-    if ([_whitelistApps containsObject:bundleID]) return NO;
-    return YES;
-}
-
-- (void)addNotification:(id)notification withBundleID:(NSString *)bundleID {
-    @synchronized (self) {
-        if (!_groupedNotifications[bundleID]) {
-            _groupedNotifications[bundleID] = [NSMutableArray array];
-        }
-        
-        [_groupedNotifications[bundleID] addObject:notification];
-        _lastNotificationTime[bundleID] = @([NSDate date].timeIntervalSince1970);
-    }
-}
-
-- (NSString *)getSummaryForBundleID:(NSString *)bundleID {
-    @synchronized (self) {
-        NSArray *notifications = _groupedNotifications[bundleID];
-        if (!notifications || notifications.count == 0) {
-            return nil;
-        }
-        
-        if (notifications.count == 1) {
-            // 只有一条通知，返回原始内容
-            id notif = notifications.firstObject;
-            return [notif valueForKey:@"_title"] ?: @"";
-        }
-        
-        // 多条通知，生成摘要
-        return [NSString stringWithFormat:@"%@ (%lu条通知)", 
-                [self getAppNameForBundleID:bundleID], 
-                (unsigned long)notifications.count];
-    }
-}
-
-- (NSString *)getAppNameForBundleID:(NSString *)bundleID {
-    // 尝试获取App名称
-    NSDictionary *bundleInfo = [NSDictionary dictionaryWithContentsOfFile:
-                                [NSString stringWithFormat:@"/var/containers/Bundle/Application/%@/Info.plist", bundleID]];
-    if (bundleInfo) {
-        return bundleInfo[@"CFBundleDisplayName"] ?: bundleInfo[@"CFBundleName"] ?: bundleID;
-    }
-    return bundleID;
-}
-
-- (void)clearNotificationsForBundleID:(NSString *)bundleID {
-    @synchronized (self) {
-        [_groupedNotifications removeObjectForKey:bundleID];
-        [_lastNotificationTime removeObjectForKey:bundleID];
+- (void)configureWithBundleID:(NSString *)bundleID count:(NSInteger)count {
+    self.iconView.image = [[NGManager sharedInstance] iconForBundleIdentifier:bundleID];
+    self.nameLabel.text = [[NGManager sharedInstance] names][bundleID] ?: bundleID;
+    
+    if (count > 0) {
+        self.countLabel.hidden = NO;
+        if (count > 99) count = 99;
+        self.countLabel.text = [NSString stringWithFormat:@" %ld ", (long)count];
+    } else {
+        self.countLabel.hidden = YES;
     }
 }
 
 @end
 
-// ============================================
-// Hook: 拦截通知
-// ============================================
-
-// iOS 17 通知中心相关类
-// 尝试hook BBDataProvider (BaseBoard)
-%hook BBDataProvider
-
-- (void)addBulletin:(id)bulletin forSectionID:(NSString *)sectionID {
-    NGNotificationManager *manager = [NGNotificationManager sharedManager];
-    
-    if ([manager shouldAggregateNotificationFromApp:sectionID]) {
-        // 检查是否在时间窗口内
-        NSNumber *lastTime = manager.lastNotificationTime[sectionID];
-        NSTimeInterval now = [NSDate date].timeIntervalSince1970;
-        
-        if (lastTime && (now - lastTime.doubleValue < manager.aggregationWindow)) {
-            // 在时间窗口内，聚合通知
-            [manager addNotification:bulletin withBundleID:sectionID];
-            
-            // 修改通知标题为摘要
-            NSString *summary = [manager getSummaryForBundleID:sectionID];
-            if (summary) {
-                [bulletin setValue:summary forKey:@"_title"];
-            }
-            
-            // 可选：不显示原始通知，只显示聚合后的
-            // return;  // 取消这行以显示聚合通知
-        } else {
-            // 超出时间窗口，清除旧通知，重新开始
-            [manager clearNotificationsForBundleID:sectionID];
-            [manager addNotification:bulletin withBundleID:sectionID];
-        }
-    }
-    
-    %orig(bulletin, sectionID);
-}
-
-%end
-
-// Hook NCNotificationRequest (iOS 17 通知请求)
-%hook NCNotificationRequest
-
-- (id)initWithBulletin:(id)bulletin sectionID:(NSString *)sectionID {
-    NGNotificationManager *manager = [NGNotificationManager sharedManager];
-    
-    if ([manager shouldAggregateNotificationFromApp:sectionID]) {
-        NSNumber *lastTime = manager.lastNotificationTime[sectionID];
-        NSTimeInterval now = [NSDate date].timeIntervalSince1970;
-        
-        if (lastTime && (now - lastTime.doubleValue < manager.aggregationWindow)) {
-            [manager addNotification:bulletin withBundleID:sectionID];
-        } else {
-            [manager clearNotificationsForBundleID:sectionID];
-            [manager addNotification:bulletin withBundleID:sectionID];
-        }
-    }
-    
-    return %orig(bulletin, sectionID);
-}
-
-%end
-
-// ============================================
-// Preference Bundle Interface
-// ============================================
-
-@interface NotificationGrouperSettingsController : UIViewController <UITableViewDataSource, UITableViewDelegate>
-@property (nonatomic, strong) UITableView *tableView;
-@property (nonatomic, strong) NSMutableDictionary *settings;
+@interface NGView : UIView <UICollectionViewDataSource, UICollectionViewDelegate, UICollectionViewDelegateFlowLayout>
+@property (nonatomic, strong) UICollectionView *collectionView;
+@property (nonatomic, strong) NSMutableArray *sortedBundleIDs;
+@property (nonatomic, assign) BOOL isExpanded;
 @end
 
-@implementation NotificationGrouperSettingsController
+@implementation NGView
 
-- (void)viewDidLoad {
-    [super viewDidLoad];
-    
-    self.title = @"NotificationGrouper";
-    self.view.backgroundColor = [UIColor systemBackgroundColor];
-    
-    // 加载设置
-    _settings = [NSMutableDictionary dictionaryWithContentsOfFile:
-                 @"/var/mobile/Library/Preferences/com.yourname.notificationgrouper.plist"];
-    if (!_settings) {
-        _settings = [NSMutableDictionary dictionary];
+- (instancetype)initWithFrame:(CGRect)frame {
+    self = [super initWithFrame:frame];
+    if (self) {
+        _sortedBundleIDs = [NSMutableArray new];
+        self.backgroundColor = [UIColor clearColor];
+        
+        UICollectionViewFlowLayout *layout = [[UICollectionViewFlowLayout alloc] init];
+        layout.scrollDirection = UICollectionViewScrollDirectionVertical;
+        layout.minimumInteritemSpacing = 2;
+        layout.minimumLineSpacing = 4;
+        layout.itemSize = CGSizeMake(52, 84);
+        
+        _collectionView = [[UICollectionView alloc] initWithFrame:self.bounds collectionViewLayout:layout];
+        _collectionView.backgroundColor = [UIColor clearColor];
+        _collectionView.dataSource = self;
+        _collectionView.delegate = self;
+        _collectionView.showsVerticalScrollIndicator = NO;
+        [_collectionView registerClass:[NGViewCell class] forCellWithReuseIdentifier:@"NGCell"];
+        [self addSubview:_collectionView];
+        
+        UITapGestureRecognizer *tap = [[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(toggleExpand)];
+        [self addGestureRecognizer:tap];
     }
-    
-    // 创建表格视图
-    _tableView = [[UITableView alloc] initWithFrame:self.view.bounds style:UITableViewStyleGrouped];
-    _tableView.dataSource = self;
-    _tableView.delegate = self;
-    [self.view addSubview:_tableView];
+    return self;
 }
 
-- (NSInteger)numberOfSectionsInTableView:(UITableView *)tableView {
-    return 3;
+- (void)layoutSubviews {
+    [super layoutSubviews];
+    self.collectionView.frame = self.bounds;
 }
 
-- (NSInteger)tableView:(UITableView *)tableView numberOfRowsInSection:(NSInteger)section {
-    switch (section) {
-        case 0: return 1;  // 开关
-        case 1: return 1;  // 时间窗口
-        case 2: return 1;  // 白名单
-        default: return 0;
-    }
-}
-
-- (NSString *)tableView:(UITableView *)tableView titleForHeaderInSection:(NSInteger)section {
-    switch (section) {
-        case 0: return @"通用";
-        case 1: return @"聚合设置";
-        case 2: return @"白名单";
-        default: return nil;
-    }
-}
-
-- (UITableViewCell *)tableView:(UITableView *)tableView cellForRowAtIndexPath:(NSIndexPath *)indexPath {
-    UITableViewCell *cell = [tableView dequeueReusableCellWithIdentifier:@"Cell"];
-    if (!cell) {
-        cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleValue1 reuseIdentifier:@"Cell"];
+- (void)refresh {
+    NGManager *mgr = [NGManager sharedInstance];
+    NSArray *allBundleIDs = [mgr.notificationRequests allKeys];
+    
+    // 排序
+    if (ngSortMode == 0) {
+        // 最新优先
+        allBundleIDs = [allBundleIDs sortedArrayUsingComparator:^NSComparisonResult(NSString *a, NSString *b) {
+            NSDate *ta = mgr.timestamps[a];
+            NSDate *tb = mgr.timestamps[b];
+            if (!ta) return NSOrderedDescending;
+            if (!tb) return NSOrderedAscending;
+            return [tb compare:ta];
+        }];
+    } else {
+        // 数量优先
+        allBundleIDs = [allBundleIDs sortedArrayUsingComparator:^NSComparisonResult(NSString *a, NSString *b) {
+            NSInteger ca = [mgr countForBundleIdentifier:a];
+            NSInteger cb = [mgr countForBundleIdentifier:b];
+            if (ca > cb) return NSOrderedAscending;
+            if (ca < cb) return NSOrderedDescending;
+            return NSOrderedSame;
+        }];
     }
     
-    switch (indexPath.section) {
-        case 0: {
-            // 总开关
-            cell.textLabel.text = @"启用通知归纳";
-            UISwitch *switchView = [[UISwitch alloc] init];
-            switchView.on = [_settings[@"enabled"] boolValue] ?: YES;
-            [switchView addTarget:self action:@selector(toggleEnabled:) forControlEvents:UIControlEventValueChanged];
-            cell.accessoryView = switchView;
-            break;
+    self.sortedBundleIDs = [allBundleIDs mutableCopy];
+    [self.collectionView reloadData];
+}
+
+- (void)toggleExpand {
+    self.isExpanded = !self.isExpanded;
+    [UIView animateWithDuration:0.25 animations:^{
+        if (self.isExpanded) {
+            self.collectionView.alpha = 1.0;
+        } else {
+            self.collectionView.alpha = 0.6;
         }
-        case 1: {
-            // 时间窗口
-            cell.textLabel.text = @"聚合时间窗口";
-            NSNumber *window = _settings[@"aggregationWindow"] ?: @300;
-            cell.detailTextLabel.text = [NSString stringWithFormat:@"%.0f秒", window.doubleValue];
-            cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
-            break;
-        }
-        case 2: {
-            // 白名单
-            cell.textLabel.text = @"不聚合的应用";
-            cell.detailTextLabel.text = @"点击管理";
-            cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
-            break;
-        }
-    }
-    
+    }];
+}
+
+- (NSInteger)collectionView:(UICollectionView *)collectionView numberOfItemsInSection:(NSInteger)section {
+    return self.sortedBundleIDs.count;
+}
+
+- (UICollectionViewCell *)collectionView:(UICollectionView *)collectionView cellForItemAtIndexPath:(NSIndexPath *)indexPath {
+    NGViewCell *cell = [collectionView dequeueReusableCellWithReuseIdentifier:@"NGCell" forIndexPath:indexPath];
+    NSString *bundleID = self.sortedBundleIDs[indexPath.item];
+    [cell configureWithBundleID:bundleID count:[NGManager sharedInstance countForBundleIdentifier:bundleID]];
     return cell;
 }
 
-- (void)toggleEnabled:(UISwitch *)sender {
-    _settings[@"enabled"] = @(sender.on);
-    [_settings writeToFile:@"/var/mobile/Library/Preferences/com.yourname.notificationgrouper.plist" atomically:YES];
-    
-    // 通知SpringBoard重新加载设置
-    notify_post("com.yourname.notificationgrouper/settingsChanged");
-}
-
-- (void)tableView:(UITableView *)tableView didSelectRowAtIndexPath:(NSIndexPath *)indexPath {
-    [tableView deselectRowAtIndexPath:indexPath animated:YES];
-    
-    if (indexPath.section == 1) {
-        // 时间窗口设置
-        UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"聚合时间窗口" 
-                                                                     message:@"设置同一应用通知的聚合时间（秒）" 
-                                                              preferredStyle:UIAlertControllerStyleAlert];
-        
-        [alert addTextFieldWithConfigurationHandler:^(UITextField *textField) {
-            textField.placeholder = @"300";
-            textField.keyboardType = UIKeyboardTypeNumberPad;
-            NSNumber *window = self.settings[@"aggregationWindow"] ?: @300;
-            textField.text = [NSString stringWithFormat:@"%.0f", window.doubleValue];
-        }];
-        
-        UIAlertAction *confirm = [UIAlertAction actionWithTitle:@"确定" 
-                                                       style:UIAlertActionStyleDefault 
-                                                     handler:^(UIAlertAction *action) {
-            NSString *input = alert.textFields.firstObject.text;
-            if (input.length > 0) {
-                self.settings[@"aggregationWindow"] = @([input doubleValue]);
-                [self.settings writeToFile:@"/var/mobile/Library/Preferences/com.yourname.notificationgrouper.plist" atomically:YES];
-                [self.tableView reloadData];
-                notify_post("com.yourname.notificationgrouper/settingsChanged");
-            }
-        }];
-        
-        UIAlertAction *cancel = [UIAlertAction actionWithTitle:@"取消" 
-                                                      style:UIAlertActionStyleCancel 
-                                                    handler:nil];
-        
-        [alert addAction:confirm];
-        [alert addAction:cancel];
-        [self presentViewController:alert animated:YES completion:nil];
-    }
+- (void)collectionView:(UICollectionView *)collectionView didSelectItemAtIndexPath:(NSIndexPath *)indexPath {
+    NSString *bundleID = self.sortedBundleIDs[indexPath.item];
+    NSLog(@"[NotificationGrouper] Tapped on %@", bundleID);
 }
 
 @end
 
-// 构造函数
-%ctor {
-    @autoreleasepool {
-        // 加载偏好设置
-        [[NGNotificationManager sharedManager] loadSettings];
+// ============================================
+// iOS 17 通知列表控制器 Hook
+// ============================================
+%group NotificationGrouperiOS17
+
+static NGView *ngBadgeView = nil;
+static BOOL ngInitialized = NO;
+
+// iOS 17 通知列表控制器
+// iOS 17 使用 NCNotificationSeparatorsListViewController 和相关类
+%hook NCNotificationSeparatorsListViewController
+
+- (void)viewDidLoad {
+    %orig;
+    if (!ngInitialized && ngEnabled) {
+        ngInitialized = YES;
         
-        // 初始化日志
-        NSLog(@"[NotificationGrouper] Loaded successfully");
+        dispatch_async(dispatch_get_main_queue(), ^{
+            if (!ngBadgeView) {
+                ngBadgeView = [[NGView alloc] initWithFrame:CGRectMake(0, 0, 52, 300)];
+                ngBadgeView.isExpanded = NO;
+                ngBadgeView.collectionView.alpha = 0.6;
+            }
+            
+            // 尝试添加到视图
+            UIView *view = self.view;
+            if (view) {
+                ngBadgeView.frame = CGRectMake(view.bounds.size.width - 56, 60, 52, view.bounds.size.height - 120);
+                [view addSubview:ngBadgeView];
+                NSLog(@"[NotificationGrouper] Badge view added to NCNotificationSeparatorsListViewController");
+            }
+        });
     }
+}
+
+%end
+
+// Hook 通知插入
+%hook NCNotificationCombinedListViewController
+
+%property (nonatomic, assign) BOOL ngAllowChanges;
+
+- (instancetype)init {
+    id orig = %orig;
+    self.ngAllowChanges = NO;
+    return orig;
+}
+
+- (bool)insertNotificationRequest:(id)req forCoalescedNotification:(id)arg2 {
+    if (!self.ngAllowChanges && ngEnabled) {
+        [[NGManager sharedInstance] insertNotificationRequest:req];
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [ngBadgeView refresh];
+        });
+    }
+    return %orig;
+}
+
+- (bool)removeNotificationRequest:(id)req forCoalescedNotification:(id)arg2 {
+    if (!self.ngAllowChanges && ngEnabled) {
+        [[NGManager sharedInstance] removeNotificationRequest:req];
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [ngBadgeView refresh];
+        });
+    }
+    return %orig;
+}
+
+%end
+
+// 通知结构化列表 (iOS 17 有些类使用这个)
+%hook NCNotificationStructuredListViewController
+
+%property (nonatomic, assign) BOOL ngAllowChanges;
+
+- (instancetype)init {
+    id orig = %orig;
+    self.ngAllowChanges = NO;
+    return orig;
+}
+
+- (bool)insertNotificationRequest:(id)req {
+    if (!self.ngAllowChanges && ngEnabled) {
+        [[NGManager sharedInstance] insertNotificationRequest:req];
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [ngBadgeView refresh];
+        });
+    }
+    return %orig;
+}
+
+- (bool)removeNotificationRequest:(id)req {
+    if (!self.ngAllowChanges && ngEnabled) {
+        [[NGManager sharedInstance] removeNotificationRequest:req];
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [ngBadgeView refresh];
+        });
+    }
+    return %orig;
+}
+
+%end
+
+// 隐藏通知分组标题 (让通知看起来更简洁)
+%hook NCNotificationListSectionHeaderView
+
+- (void)layoutSubviews {
+    %orig;
+    self.hidden = YES;
+}
+
+- (CGRect)frame {
+    CGRect orig = %orig;
+    return CGRectZero;
+}
+
+%end
+
+// 隐藏"没有旧通知"提示
+%hook NCNotificationListSectionRevealHintView
+
+- (void)layoutSubviews {
+    %orig;
+    for (UIView *subview in self.subviews) {
+        if ([subview isKindOfClass:[UILabel class]]) {
+            UILabel *label = (UILabel *)subview;
+            if ([label.text containsString:@"older"] || [label.text containsString:@"更早"]) {
+                label.hidden = YES;
+            }
+        }
+    }
+}
+
+%end
+
+%end
+
+// ============================================
+// 构造函数
+// ============================================
+%ctor {
+    NSLog(@"[NotificationGrouper] Loading...");
+    loadPrefs();
+    
+    if (ngEnabled) {
+        %init(NotificationGrouperiOS17);
+        NSLog(@"[NotificationGrouper] iOS 17 hooks initialized");
+    }
+    
+    // 监听设置变更
+    CFNotificationCenterAddObserver(
+        CFNotificationCenterGetDarwinNotifyCenter(),
+        NULL,
+        (CFNotificationCallback)loadPrefs,
+        CFSTR("com.yourname.notificationgrouper/ReloadPrefs"),
+        NULL,
+        CFNotificationSuspensionBehaviorCoalesce
+    );
 }
