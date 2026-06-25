@@ -13,10 +13,10 @@ NotificationGrouper_FILES = Tweak.x
 NotificationGrouper_CFLAGS = -fobjc-arc -Wno-error
 NotificationGrouper_LDFLAGS = -framework Foundation -framework UIKit -lsubstrate
 
-# Package output
+# Rootless package (Dopamine/Palera1n)
+THEOS_PACKAGE_SCHEME = rootless
 THEOS_PACKAGE_DIR = debs
 THEOS_LDID_FLAGS = -S
-# Note: layout already uses /var/jb/ prefix for rootless jailbreaks
 
 include $(THEOS_MAKE_PATH)/tweak.mk
 
