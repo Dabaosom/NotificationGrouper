@@ -350,5 +350,3 @@
         NSLog(@"[NotificationGrouper] Loaded successfully");
     }
 }
-
-%end
