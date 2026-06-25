@@ -40,7 +40,7 @@ static NSInteger ngSortMode = 0;
 - (NSString *)notificationIdentifier;
 - (id)bulletin;
 - (NSString *)destinationBundleIdentifier;
-- (NSDate *)timestamp;
+
 - (id)content;
 @end
 
@@ -169,13 +169,11 @@ static NSInteger ngSortMode = 0;
         }
     }
     
-    if ([req respondsToSelector:@selector(timestamp)]) {
-        id ts = [req timestamp];
-        if ([ts isKindOfClass:[NSDate class]]) {
-            NSDate *existing = self.timestamps[bundleID];
-            if (!existing || [(NSDate *)ts compare:existing] == NSOrderedDescending) {
-                self.timestamps[bundleID] = ts;
-            }
+    id ts = [req valueForKey:@"timestamp"];
+    if ([ts isKindOfClass:[NSDate class]]) {
+        NSDate *existing = self.timestamps[bundleID];
+        if (!existing || [(NSDate *)ts compare:existing] == NSOrderedDescending) {
+            self.timestamps[bundleID] = ts;
         }
     }
     
