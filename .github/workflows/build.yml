@@ -1,4 +1,3 @@
-
 name: Build NotificationGrouper
 
 on:
@@ -19,28 +18,17 @@ jobs:
       run: |
         export THEOS=/Users/runner/work/Theos
         git clone --recursive https://github.com/theos/theos.git $THEOS
-        
-        # 安装 ldid (iOS 签名工具)
         brew install ldid
-        
         echo "THEOS=$THEOS" >> $GITHUB_ENV
         echo "PATH=$THEOS/bin:$PATH" >> $GITHUB_ENV
       shell: bash
       
     - name: Download iOS 17 SDK
       run: |
-        # 尝试从 MagicFoundation/PlatformSDKs 下载
-        curl -L -o ios17.sdk.tar.xz "https://github.com/MagicFoundation/PlatformSDKs/releases/download/ios-17.0/sdk.tar.xz" || {
-          echo "::warning::Failed to download iOS 17 SDK, trying alternative..."
-          # 备选方案：使用 iOS 16.5 SDK
-          curl -L -o ios16.sdk.tar.xz "https://github.com/MagicFoundation/PlatformSDKs/releases/download/ios-16.5/sdk.tar.xz"
-        }
-        
-        # 解压 SDK
         mkdir -p $THEOS/sdks
-        tar -xf ios*.sdk.tar.xz -C $THEOS/sdks/
-        
-        # 验证 SDK
+        curl -L -o /tmp/ios17.sdk.tar.xz "https://github.com/MagicFoundation/PlatformSDKs/releases/download/ios-17.0/sdk.tar.xz" && \
+          tar -xf /tmp/ios17.sdk.tar.xz -C $THEOS/sdks/ || \
+          echo "::warning::iOS 17 SDK download failed, will try iOS 16.5"
         ls -la $THEOS/sdks/
       shell: bash
       continue-on-error: true
@@ -49,13 +37,15 @@ jobs:
       run: |
         cd $GITHUB_WORKSPACE
         make clean
-        make package FINALPACKAGE=1
+        make package FINALPACKAGE=1 THEOS_PACKAGE_DIR=packages
+        ls -la packages/
+        ls -la .theos/obj/
       shell: bash
       
     - name: Upload DEB Package
       uses: actions/upload-artifact@v4
       with:
         name: NotificationGrouper-DEB
-        path: debs/*.deb
+        path: packages/*.deb
         retention-days: 30
       if: always()
