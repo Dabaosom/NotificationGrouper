@@ -33,13 +33,17 @@ jobs:
       shell: bash
       continue-on-error: true
       
-    - name: Build Tweak
+    - name: Build Tweak (Rootless)
       run: |
         cd $GITHUB_WORKSPACE
         make clean
-        make package FINALPACKAGE=1 THEOS_PACKAGE_DIR=packages
+        make package FINALPACKAGE=1 THEOS_PACKAGE_DIR=packages THEOS_PACKAGE_SCHEME=rootless
         ls -la packages/
-        ls -la .theos/obj/
+        ls -la .theos/obj/deb/
+        echo "=== Checking deb structure ==="
+        if command -v dpkg-deb &> /dev/null; then
+          dpkg-deb -c packages/*.deb || true
+        fi
       shell: bash
       
     - name: Upload DEB Package

@@ -13,7 +13,7 @@ NotificationGrouper_FILES = Tweak.x
 NotificationGrouper_CFLAGS = -fobjc-arc -Wno-error
 NotificationGrouper_LDFLAGS = -framework Foundation -framework UIKit -lsubstrate
 
-# Rootless package
+# Rootless package (Dopamine/Palera1n)
 THEOS_PACKAGE_SCHEME = rootless
 THEOS_PACKAGE_DIR = debs
 THEOS_LDID_FLAGS = -S
